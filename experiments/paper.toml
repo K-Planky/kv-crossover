@@ -1,0 +1,12 @@
+# Paths relative to this config; both files come from FAST25-release/traces/.
+[mooncake]
+repository = "https://github.com/kvcache-ai/Mooncake"
+revision = "df19e4eeb8bf49836f3612d8eb7b5b76fa757ee2"
+
+[mooncake.conversation]
+path = "../data/mooncake/conversation_trace.jsonl"
+sha256 = "b8cbb061a85206d729d91cdc2981f43c9e0d99209dce588d3af5f7934408b9df"
+
+[mooncake.toolagent]
+path = "../data/mooncake/toolagent_trace.jsonl"
+sha256 = "48a2db1a13d3bc05e6330140c64f604ba366df20d3c9e128b5c35a01c1fa5f71"

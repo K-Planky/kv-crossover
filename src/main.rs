@@ -1,3 +1,5 @@
+mod audit;
+
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
@@ -13,10 +15,21 @@ struct Cli {
 enum Command {
     /// Match an arriving prompt against a resident prompt (two JSONL lines, resident first).
     Prefix { path: PathBuf },
+    /// Verify both pinned workloads and summarize input plus output lengths.
+    Audit {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    let Command::Prefix { path } = cli.command;
+    match cli.command {
+        Command::Audit { config } => audit::run(&config),
+        Command::Prefix { path } => prefix(path),
+    }
+}
+
+fn prefix(path: PathBuf) -> Result<(), String> {
     let input = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut lines = input.lines();
     let mut record = |number| {

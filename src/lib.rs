@@ -1,3 +1,5 @@
+pub mod workload;
+
 use serde::Deserialize;
 
 pub const BLOCK_TOKENS: usize = 512;
