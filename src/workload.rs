@@ -7,7 +7,7 @@ use std::{
 };
 
 /// One-based source line within a single workload, not an index into a filtered run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RequestId(pub usize);
 
 pub struct Arrival {

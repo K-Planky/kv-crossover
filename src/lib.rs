@@ -1,4 +1,5 @@
 pub mod profile;
+pub mod replay;
 pub mod workload;
 
 use serde::Deserialize;
