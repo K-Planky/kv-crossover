@@ -1,4 +1,5 @@
 pub mod kv;
+mod link;
 pub mod profile;
 pub mod replay;
 pub mod workload;

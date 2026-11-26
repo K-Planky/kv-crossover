@@ -1,13 +1,15 @@
 //! Single-threaded event clock for both workers and the shared link.
 use crate::{
-    TraceRequest,
+    BLOCK_TOKENS, TraceRequest,
+    kv::BYTES_PER_TOKEN,
     kv::{Cache, Lease},
+    link::Link,
     profile::{self, Profile},
     workload::{Arrival, RequestId},
 };
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
     num::NonZeroU64,
 };
 
@@ -15,6 +17,14 @@ use std::{
 pub enum WorkerId {
     A,
     B,
+}
+impl WorkerId {
+    fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
 }
 pub use crate::kv::BlockId;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -131,7 +141,10 @@ pub struct Replay<'p> {
     awaiting_placement: HashSet<RequestId>,
     workers: [Worker; 2],
     profile: &'p Profile,
-    link_bytes_per_second: NonZeroU64,
+    link: Link<(WorkerId, Vec<BlockId>)>,
+    // One waiter list per physical block; one job may depend on several batches.
+    waiters: BTreeMap<(WorkerId, BlockId), Vec<RequestId>>,
+    pending: HashMap<RequestId, (Job, usize)>,
 }
 impl<'p> Replay<'p> {
     pub fn new(
@@ -148,7 +161,9 @@ impl<'p> Replay<'p> {
             awaiting_placement: HashSet::new(),
             workers: std::array::from_fn(|_| Worker::new(kv_bytes_each)),
             profile,
-            link_bytes_per_second,
+            link: Link::new(link_bytes_per_second),
+            waiters: BTreeMap::new(),
+            pending: HashMap::new(),
         };
         let mut previous_id = None;
         for Arrival { id, request } in arrivals {
@@ -183,7 +198,7 @@ impl<'p> Replay<'p> {
         self.now_ns
     }
     pub fn link_bytes_per_second(&self) -> NonZeroU64 {
-        self.link_bytes_per_second
+        self.link.rate
     }
     /// Execution-side trace data, not a router view.
     pub fn request(&self, id: RequestId) -> Option<&TraceRequest> {
@@ -215,8 +230,12 @@ impl<'p> Replay<'p> {
             input: r.input_length,
             outputs_left: r.output_length,
         };
-        self.wake(worker)?;
         self.awaiting_placement.remove(&id);
+        self.ready(worker, job)
+    }
+    fn ready(&mut self, worker: WorkerId, job: Job) -> Result<(), String> {
+        self.wake(worker)?;
+        let cached = job.processed;
         let w = &mut self.workers[worker as usize];
         if cached == job.input {
             w.responses.push_back(job)
@@ -232,6 +251,78 @@ impl<'p> Replay<'p> {
         }
         Ok(())
     }
+    pub fn delivered_bytes(&self) -> u128 {
+        self.link.delivered_bytes
+    }
+
+    /// Place a request using the first `prefix_blocks` complete blocks on `dst`.
+    /// Join existing deliveries; batch only newly missing blocks into one copy.
+    pub fn transfer(
+        &mut self,
+        dst: WorkerId,
+        id: RequestId,
+        prefix_blocks: usize,
+    ) -> Result<(), String> {
+        let src = dst.other();
+        if !self.awaiting_placement.contains(&id) {
+            return Err(format!("request {}: not awaiting placement", id.0));
+        }
+        let r = &self.requests[&id];
+        let blocks = BlockId::prompt(r);
+        if !profile::supported(r) || prefix_blocks == 0 || prefix_blocks > blocks.len() {
+            return Err(format!(
+                "request {}: unsupported transfer prefix/lengths",
+                id.0
+            ));
+        }
+        let mut missing = Vec::new();
+        let mut new = Vec::new();
+        for block in &blocks[..prefix_blocks] {
+            if self.is_resident(dst, block) {
+                continue;
+            }
+            missing.push(block.clone());
+            if self.waiters.contains_key(&(dst, block.clone())) {
+                continue;
+            }
+            if !self.is_resident(src, block) || self.workers[dst as usize].cache.is_incoming(block)
+            {
+                return Err(format!(
+                    "request {}: block {block:?} unavailable for transfer to {dst:?}",
+                    id.0
+                ));
+            }
+            new.push(block.clone());
+        }
+        let (processed, lease) = self.workers[dst as usize]
+            .cache
+            .admit_prefix(r, blocks, prefix_blocks, &new, self.now_ns)
+            .ok_or_else(|| format!("request {}: insufficient KV on {dst:?}", id.0))?;
+        let job = Job {
+            id,
+            processed,
+            lease,
+            input: r.input_length,
+            outputs_left: r.output_length,
+        };
+        self.awaiting_placement.remove(&id);
+        if missing.is_empty() {
+            return self.ready(dst, job);
+        }
+        self.pending.insert(id, (job, missing.len()));
+        for block in missing {
+            self.waiters.entry((dst, block)).or_default().push(id);
+        }
+        if !new.is_empty() {
+            for block in &new {
+                self.workers[src as usize].cache.pin(block, self.now_ns);
+            }
+            let bytes = new.len() as u64 * BLOCK_TOKENS as u64 * BYTES_PER_TOKEN;
+            self.link.start(self.now_ns, bytes, (dst, new));
+        }
+        Ok(())
+    }
+    /// Synthetic cache-warming delivery for controlled initial states, not a physical copy.
     pub fn receive_after(
         &mut self,
         worker: WorkerId,
@@ -248,7 +339,23 @@ impl<'p> Replay<'p> {
     /// Apply completions before arrivals, and dispatch after all arrivals at this tick.
     /// A clock/scheduling error is fatal to this run.
     pub fn step(&mut self) -> Result<Option<Event>, String> {
-        while let Some(Reverse((at, _, _, tick))) = self.events.pop() {
+        loop {
+            // Compare the next physical finish directly with the heap. A new
+            // copy changes this deadline without leaving obsolete heap ticks.
+            if let Some(end) = self.link.next_finish()?
+                && self.events.peek().is_none_or(|e| end <= e.0.0)
+            {
+                for (dst, blocks) in self.link.finish(end) {
+                    self.link.delivered_bytes +=
+                        blocks.len() as u128 * BLOCK_TOKENS as u128 * u128::from(BYTES_PER_TOKEN);
+                    for block in blocks {
+                        self.schedule(end, Tick::Publish(Event::BlockReceived(dst, block)))?;
+                    }
+                }
+            }
+            let Some(Reverse((at, _, _, tick))) = self.events.pop() else {
+                return Ok(None);
+            };
             self.now_ns = at;
             match tick {
                 Tick::Dispatch(worker) => {
@@ -279,6 +386,18 @@ impl<'p> Replay<'p> {
                         }
                         Event::BlockReceived(worker, block) => {
                             self.workers[*worker as usize].cache.receive(block, at);
+                            if let Some(ids) = self.waiters.remove(&(*worker, block.clone())) {
+                                self.workers[worker.other() as usize].cache.unpin(block, at);
+                                for id in ids {
+                                    self.workers[*worker as usize].cache.pin(block, at);
+                                    let (_, left) = self.pending.get_mut(&id).unwrap();
+                                    *left -= 1;
+                                    if *left == 0 {
+                                        let (job, _) = self.pending.remove(&id).unwrap();
+                                        self.ready(*worker, job)?;
+                                    }
+                                }
+                            }
                         }
                         Event::DecodeCapacityFailure(_, _) => (),
                         Event::Arrival(id) => {
@@ -289,6 +408,5 @@ impl<'p> Replay<'p> {
                 }
             }
         }
-        Ok(None)
     }
 }

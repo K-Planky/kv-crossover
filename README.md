@@ -53,7 +53,21 @@ and one output token. A failed admission changes no cache state. A prefill
 completion publishes each newly finished full block, merging identical KV if
 another job or delivery already published it. Partial blocks and output KV
 stay private. A scheduled incoming block holds 512 slots but is not a hit until
-delivery; this step models destination memory, not link contention.
+delivery. `Replay::transfer` admits the private suffix and first output slot
+before starting a copy. All newly needed remote blocks for that placement
+travel as one batch and become available together. An overlapping request
+joins by (destination, full block path); only its additional missing blocks
+start another batch. Source blocks stay pinned through delivery; each waiter
+then holds destination pins until its own job releases them. Jobs enter the
+ready queue only when all required batches have arrived.
+
+Both directions share one configured bytes/second rate equally per active
+batch, independently of worker compute. The clock recomputes the next finish
+on active-set changes, publishes deliveries before tied arrivals, and counts
+payload bytes once per completed batch. Service is accounted in billionths
+of a byte (discarding less than one such unit per active batch per update);
+completion rounds up to a nanosecond. `receive_after` is a synthetic fixture
+for seeding controlled states; it does not contribute link traffic.
 
 After a decode batch emits, release finished jobs first. In batch order, each
 survivor reserves one more slot. If it cannot, report a decode capacity failure

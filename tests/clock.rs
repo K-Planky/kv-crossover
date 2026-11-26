@@ -243,6 +243,138 @@ fn published_blocks_stay_pinned_until_decode_failure() {
 }
 
 #[test]
+fn two_placements_join_a_batch_while_destination_computes() {
+    let p = profile();
+    let bytes = 1024 * BYTES_PER_TOKEN;
+    let mut r = Replay::new(
+        vec![
+            row(1, 0, 1, 1),
+            row(2, 1, 1024, 1),
+            row(3, 2, 1024, 1),
+            row(4, 3, 1024, 1),
+        ],
+        nz(bytes * 500),
+        &p,
+        1028 * BYTES_PER_TOKEN,
+    )
+    .unwrap();
+    for n in 1..=2 {
+        r.receive_after(A, BlockId(vec![0; n]), nz(1)).unwrap();
+    }
+    let mut received = Vec::new();
+    let mut decoded = Vec::new();
+    while let Some(e) = r.step().unwrap() {
+        match e {
+            Arr(RequestId(1)) => r.enqueue(B, RequestId(1)).unwrap(),
+            Arr(id @ RequestId(2 | 3)) => {
+                r.transfer(B, id, 2).unwrap();
+                assert!(!r.is_resident(B, &BlockId(vec![0])));
+                assert!(r.receive_after(A, BlockId(vec![99]), nz(1)).is_err());
+            }
+            Arr(RequestId(4)) => {
+                assert_eq!(received, [BlockId(vec![0]), BlockId(vec![0, 0])]);
+                assert_eq!(r.used_kv_tokens(B), 1028); // two private decode slots plus busy prompt/output
+                assert!(r.enqueue(B, RequestId(4)).is_err());
+                r.receive_after(A, BlockId(vec![99]), nz(1)).unwrap(); // source pins released
+            }
+            BlockReceived(B, block) => {
+                assert_eq!(r.now_ns(), 3_000_000);
+                received.push(block);
+            }
+            WorkDone(B, Phase::Decode(ids)) => decoded.extend(ids),
+            WorkDone(B, Phase::Prefill { id, .. }) => assert_eq!(id, RequestId(1)),
+            BlockReceived(A, _) => (),
+            _ => unreachable!(),
+        }
+    }
+    decoded.sort();
+    assert_eq!(decoded, [RequestId(1), RequestId(2), RequestId(3)]);
+    assert_eq!(r.delivered_bytes(), u128::from(bytes));
+    assert_eq!(r.used_kv_tokens(B), 1024);
+    r.receive_after(B, BlockId(vec![99]), nz(1)).unwrap();
+    r.receive_after(B, BlockId(vec![0]), nz(1)).unwrap(); // evicted and re-reservable
+}
+
+#[test]
+fn valid_copy_can_retry_after_destination_pressure_clears() {
+    let p = profile();
+    let mut r = Replay::new(
+        vec![row(1, 0, 1, 1), row(2, 1, 512, 1)],
+        nz(1 << 30),
+        &p,
+        513 * BYTES_PER_TOKEN,
+    )
+    .unwrap();
+    r.receive_after(A, BlockId(vec![0]), nz(1)).unwrap();
+    let id = RequestId(2);
+    let mut served = false;
+    while let Some(e) = r.step().unwrap() {
+        match e {
+            Arr(RequestId(1)) => r.enqueue(B, RequestId(1)).unwrap(),
+            Arr(_) => {
+                assert!(
+                    r.transfer(B, id, 1)
+                        .unwrap_err()
+                        .contains("insufficient KV")
+                );
+                assert_eq!(r.used_kv_tokens(B), 2);
+            }
+            WorkDone(B, Phase::Decode(ids)) if ids == [RequestId(1)] => {
+                r.transfer(B, id, 1).unwrap()
+            }
+            WorkDone(B, Phase::Decode(ids)) => {
+                assert_eq!(ids, [id]);
+                served = true;
+            }
+            _ => (),
+        }
+    }
+    assert!(served);
+    assert_eq!(r.delivered_bytes(), u128::from(512 * BYTES_PER_TOKEN));
+    assert_eq!(r.used_kv_tokens(B), 512);
+}
+
+#[test]
+fn partial_join_waits_for_both_batches_and_does_not_resend_root() {
+    let p = profile();
+    let block_bytes = 512 * BYTES_PER_TOKEN;
+    let mut r = Replay::new(
+        vec![row(1, 1, 512, 1), row(2, 2, 1024, 1)],
+        nz(block_bytes * 250),
+        &p,
+        BUDGET,
+    )
+    .unwrap();
+    r.receive_after(A, BlockId(vec![0]), nz(1)).unwrap();
+    let mut deliveries = Vec::new();
+    let mut decoded = Vec::new();
+    while let Some(e) = r.step().unwrap() {
+        match e {
+            Arr(RequestId(1)) => {
+                // Admission failure must not leave a waiter, pin or reservation.
+                assert!(r.transfer(A, RequestId(1), 2).is_err());
+                r.transfer(B, RequestId(1), 1).unwrap();
+                r.receive_after(A, BlockId(vec![0, 0]), nz(1)).unwrap();
+            }
+            Arr(id) => r.transfer(B, id, 2).unwrap(),
+            BlockReceived(B, block) => deliveries.push((r.now_ns(), block)),
+            WorkDone(B, Phase::Decode(ids)) => decoded.extend(ids),
+            BlockReceived(A, _) => (),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        deliveries,
+        [
+            (8_000_000, BlockId(vec![0])),
+            (9_000_000, BlockId(vec![0, 0]))
+        ]
+    );
+    assert_eq!(r.delivered_bytes(), u128::from(block_bytes * 2));
+    assert_eq!(decoded, [RequestId(1), RequestId(2)]);
+}
+
+#[test]
 fn incoming_space_and_deterministic_eviction() {
     let p = profile();
     let mut r = Replay::new(vec![row(1, 1, 1024, 1)], nz(1), &p, 1536 * BYTES_PER_TOKEN).unwrap();

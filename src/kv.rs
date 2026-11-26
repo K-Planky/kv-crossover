@@ -78,15 +78,28 @@ impl Cache {
     pub fn admit(&mut self, r: &TraceRequest, now: u64) -> Option<(usize, Lease)> {
         let blocks = BlockId::prompt(r);
         let pinned = blocks.iter().take_while(|b| self.contains(b)).count();
+        self.admit_prefix(r, blocks, pinned, &[], now)
+    }
+    /// Charge all private slots and *new* incoming reservations atomically.
+    /// A missing prefix pin is acquired by the receiver before the job runs.
+    pub fn admit_prefix(
+        &mut self,
+        r: &TraceRequest,
+        blocks: Vec<BlockId>,
+        pinned: usize,
+        new: &[BlockId],
+        now: u64,
+    ) -> Option<(usize, Lease)> {
         let cached = pinned * BLOCK_TOKENS;
         let private = (r.input_length - cached) as u64 + 1;
-        if !self.allocate(private, &blocks[..pinned]) {
+        if !self.allocate(private + new.len() as u64 * BLOCK, &blocks[..pinned]) {
             return None;
         }
+        self.incoming.extend(new.iter().cloned());
         for k in &blocks[..pinned] {
-            let v = self.resident.get_mut(k).unwrap();
-            v.pins += 1;
-            v.last_use_ns = now;
+            if self.contains(k) {
+                self.pin(k, now);
+            }
         }
         Some((
             cached,
@@ -124,6 +137,19 @@ impl Cache {
             v.pins -= 1;
             v.last_use_ns = now;
         }
+    }
+    pub fn pin(&mut self, k: &BlockId, now: u64) {
+        let v = self.resident.get_mut(k).unwrap();
+        v.pins += 1;
+        v.last_use_ns = now;
+    }
+    pub fn unpin(&mut self, k: &BlockId, now: u64) {
+        let v = self.resident.get_mut(k).unwrap();
+        v.pins -= 1;
+        v.last_use_ns = now;
+    }
+    pub fn is_incoming(&self, k: &BlockId) -> bool {
+        self.incoming.contains(k)
     }
     pub fn reserve(&mut self, k: &BlockId) -> Result<(), String> {
         if k.0.is_empty() || self.contains(k) || self.incoming.contains(k) {
