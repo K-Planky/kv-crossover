@@ -1,4 +1,15 @@
-# Paths relative to this config; both files come from FAST25-release/traces/.
+# Paths relative to this config; the two Mooncake files come from FAST25-release/traces/.
+[vidur_a100]
+repository = "https://github.com/microsoft/vidur"
+revision = "abae7f63aa857300f5cdc6f5e0d27860cd24721b"
+model = "meta-llama/Meta-Llama-3-8B"
+path = "../profiles/a100.csv"
+sha256 = "c06624ecb179468713ed9996744ab150396843f4e3deec8ef08cecd32428c10c"
+
+# Upstream: data/profiling/compute/a100/{model}/
+[vidur_a100.inputs]
+"attention.csv" = "9d57142a293156a15e14fdf69a597fdaa7ff2b478baf4c431b20a9491a19a87a"
+"mlp.csv" = "98c26488298e324e89db7349e213f75c856ae83dc6b17548a68636d2cb5efff0"
 [mooncake]
 repository = "https://github.com/kvcache-ai/Mooncake"
 revision = "df19e4eeb8bf49836f3612d8eb7b5b76fa757ee2"

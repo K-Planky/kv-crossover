@@ -17,6 +17,9 @@ The matcher compares hashes in order until the first difference. Only full
 512-token blocks from both prompts qualify. Here 12 blocks match; the remaining
 328 of the arriving prompt’s 6,472 tokens need local processing.
 
+The [A100 pilot profile](profiles/README.md) estimates worker compute costs;
+it is not yet a qualified replay configuration.
+
 ## FAST ’25 workload audit
 
 ```sh
