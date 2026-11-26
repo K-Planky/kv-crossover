@@ -93,6 +93,26 @@ impl Profile {
 mod tests {
     use super::*;
     #[test]
+    fn oversized_profile_cost_rejects_router_score() {
+        use crate::router::{RouterView, WorkerView};
+        let p = Profile {
+            prefill: [[u64::MAX; 2]; CONTEXT / CHUNK],
+            decode: [[1; CONTEXT / 64]; BATCH],
+        };
+        let view = RouterView {
+            input_tokens: 1,
+            workers: std::array::from_fn(|_| WorkerView {
+                cached_tokens: 0,
+                can_admit_local: true,
+                jobs: vec![],
+            }),
+            transfers: vec![],
+            mean_output_tokens: 1,
+        };
+        assert!(view.local_scores(&p).unwrap_err().contains("overflow"));
+    }
+
+    #[test]
     fn qualified_shapes_and_boundaries() {
         let p = Profile::parse(include_str!("../profiles/a100.csv")).unwrap();
         assert_eq!(p.prefill_ns(6144, 1), Ok(14_177_252));

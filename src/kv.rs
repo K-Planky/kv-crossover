@@ -52,6 +52,17 @@ impl Cache {
     pub fn contains(&self, block: &BlockId) -> bool {
         self.resident.contains_key(block)
     }
+    pub fn can_allocate(&self, slots: u64, protect: &[BlockId]) -> bool {
+        let needed = slots
+            .saturating_sub(self.capacity - self.used)
+            .div_ceil(BLOCK);
+        self.resident
+            .iter()
+            .filter(|(b, v)| v.pins == 0 && !protect.contains(b))
+            .take(needed as usize)
+            .count() as u64
+            == needed
+    }
     fn allocate(&mut self, slots: u64, protect: &[BlockId]) -> bool {
         let needed = slots
             .saturating_sub(self.capacity - self.used)

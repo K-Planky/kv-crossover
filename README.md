@@ -23,6 +23,26 @@ attention measurements are insufficient, which arrivals qualify and how
 much potential prefix reuse is lost. The [profile guide](profiles/README.md)
 documents the predictor and how to regenerate its timing table.
 
+## Local router baselines
+
+At arrival, `Replay::router_view` snapshots both workers' complete resident
+prefixes, local admission feasibility, assigned jobs (including copy waiters),
+and active physical copies with remaining bytes rounded up. The local policies
+ignore the link. Shortest queue minimizes assigned request count; the
+[Preble-inspired](https://proceedings.iclr.cc/paper_files/paper/2025/hash/5bc342f48de8264779952fac378f96dc-Abstract-Conference.html) rule minimizes
+predicted backlog + uncached chunk times + one decode step. Both skip infeasible
+workers, break ties toward A and reuse the chosen worker's local prefix.
+
+Backlog is an approximation, not a forward run of the scheduler. Charge each
+assigned job its uncompleted prefill chunks and estimated remaining tokens at
+the single-response decode cost for its current (or post-prefill) context.
+Estimate total output as the rounded-up mean emitted by successfully finished
+responses across both workers, initially one. Subtract tokens already emitted,
+leaving at least one for an unfinished job, bounded by the context limit.
+This serial-work proxy ignores batching, copy delays and fractional progress
+inside a phase: a long response can make a worker look busier than it is.
+Neither scoring nor history estimation reads recorded output lengths.
+
 ## Worker rounds
 
 Both workers use the same nonpreemptive scheduler. At each clock tick the

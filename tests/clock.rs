@@ -267,6 +267,15 @@ fn two_placements_join_a_batch_while_destination_computes() {
         match e {
             Arr(RequestId(1)) => r.enqueue(B, RequestId(1)).unwrap(),
             Arr(id @ RequestId(2 | 3)) => {
+                if id == RequestId(3) {
+                    let view = r.router_view(id).unwrap();
+                    assert_eq!(view.transfers.len(), 1);
+                    assert_eq!(view.transfers[0].remaining_bytes, bytes / 2);
+                    // Two assigned logical jobs, including the copy waiter.
+                    // No room for local recomputation while its reservation is live.
+                    assert!(!view.workers[1].can_admit_local);
+                    assert!(view.local_scores(&p).unwrap().iter().all(|s| s.worker != B));
+                }
                 r.transfer(B, id, 2).unwrap();
                 assert!(!r.is_resident(B, &BlockId(vec![0])));
                 assert!(r.receive_after(A, BlockId(vec![99]), nz(1)).is_err());
@@ -372,6 +381,64 @@ fn partial_join_waits_for_both_batches_and_does_not_resend_root() {
     );
     assert_eq!(r.delivered_bytes(), u128::from(block_bytes * 2));
     assert_eq!(decoded, [RequestId(1), RequestId(2)]);
+}
+
+#[test]
+fn view_expires_on_the_next_event_even_for_tied_arrivals() {
+    let p = profile();
+    let mut r = Replay::new(vec![row(1, 0, 1, 1), row(2, 0, 1, 1)], nz(1), &p, BUDGET).unwrap();
+    r.step().unwrap();
+    assert!(r.router_view(RequestId(1)).is_ok());
+    r.step().unwrap();
+    assert!(r.router_view(RequestId(1)).is_err());
+    assert!(r.router_view(RequestId(2)).is_ok());
+}
+
+#[test]
+fn local_policies_use_only_observed_work() {
+    use kv_crossover::router::LocalPolicy::{CacheAware, ShortestQueue};
+    let p = profile();
+    let score = |future| {
+        let mut r = Replay::new(
+            vec![
+                row(1, 0, 1024, 3),
+                row(2, 500, 1024, future),
+                row(3, 515, 1024, future),
+            ],
+            nz(1),
+            &p,
+            BUDGET,
+        )
+        .unwrap();
+        while let Some(e) = r.step().unwrap() {
+            match e {
+                Arr(id @ RequestId(1)) => {
+                    let scores = r.router_view(id).unwrap().local_scores(&p).unwrap();
+                    assert_eq!(ShortestQueue.choose(&scores), Some(A));
+                    assert_eq!(CacheAware.choose(&scores), Some(A));
+                    r.enqueue(A, id).unwrap();
+                }
+                Arr(id @ RequestId(2)) => r.enqueue(A, id).unwrap(),
+                Arr(id) => {
+                    let view = r.router_view(id).unwrap();
+                    let scores = view.local_scores(&p).unwrap();
+                    // A's finished response had three tokens. Its new response
+                    // has emitted one by 515 ms, leaving two estimated steps.
+                    assert_eq!(
+                        scores[0].predicted_backlog_ns,
+                        2 * p.decode_ns(&[1025]).unwrap()
+                    );
+                    assert_eq!(view.workers[0].cached_tokens, 1024);
+                    assert_eq!(ShortestQueue.choose(&scores), Some(B));
+                    assert_eq!(CacheAware.choose(&scores), Some(A));
+                    return (view, scores);
+                }
+                _ => (),
+            }
+        }
+        unreachable!()
+    };
+    assert_eq!(score(2), score(500));
 }
 
 #[test]

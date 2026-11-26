@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 
 const NS_PER_SECOND: u128 = 1_000_000_000;
 
+#[derive(Clone)]
 pub(crate) struct Link<T> {
     pub rate: NonZeroU64,
     at_ns: u64,
@@ -45,6 +46,18 @@ impl<T> Link<T> {
     pub fn start(&mut self, now: u64, bytes: u64, batch: T) {
         self.advance(now);
         self.active.push((u128::from(bytes) * NS_PER_SECOND, batch));
+    }
+    pub fn observed(&self, now: u64) -> Vec<(u64, T)>
+    where
+        T: Clone,
+    {
+        let mut snapshot = self.clone();
+        snapshot.advance(now);
+        snapshot
+            .active
+            .into_iter()
+            .map(|(w, t)| (w.div_ceil(NS_PER_SECOND) as u64, t))
+            .collect()
     }
     pub fn next_finish(&self) -> Result<Option<u64>, String> {
         let Some(shortest) = self.active.iter().map(|(work, _)| *work).min() else {

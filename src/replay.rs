@@ -5,6 +5,7 @@ use crate::{
     kv::{Cache, Lease},
     link::Link,
     profile::{self, Profile},
+    router::{JobView, RouterView, TransferView, WorkerView},
     workload::{Arrival, RequestId},
 };
 use std::{
@@ -58,6 +59,8 @@ struct Worker {
     cache: Cache,
     busy_or_scheduled: bool,
     prefill_turn: bool,
+    completed: u64,
+    emitted_on_completion: u128,
 }
 impl Worker {
     fn new(kv_bytes: u64) -> Self {
@@ -67,6 +70,8 @@ impl Worker {
             cache: Cache::new(kv_bytes),
             busy_or_scheduled: false,
             prefill_turn: false,
+            completed: 0,
+            emitted_on_completion: 0,
         }
     }
     fn next_phase(&self, p: &Profile) -> Result<Option<(Phase, u64)>, String> {
@@ -113,6 +118,8 @@ impl Worker {
                     j.processed += 1;
                     j.outputs_left -= 1;
                     if j.outputs_left == 0 {
+                        self.completed += 1;
+                        self.emitted_on_completion += (j.processed - j.input) as u128;
                         self.cache.release(j.lease, now);
                     } else {
                         continuing.push(j);
@@ -139,12 +146,13 @@ pub struct Replay<'p> {
     sequence: u64,
     requests: HashMap<RequestId, TraceRequest>,
     awaiting_placement: HashSet<RequestId>,
+    current_arrival: Option<RequestId>,
     workers: [Worker; 2],
     profile: &'p Profile,
     link: Link<(WorkerId, Vec<BlockId>)>,
     // One waiter list per physical block; one job may depend on several batches.
     waiters: BTreeMap<(WorkerId, BlockId), Vec<RequestId>>,
-    pending: HashMap<RequestId, (Job, usize)>,
+    pending: BTreeMap<RequestId, (Job, WorkerId, usize)>,
 }
 impl<'p> Replay<'p> {
     pub fn new(
@@ -159,11 +167,12 @@ impl<'p> Replay<'p> {
             sequence: 0,
             requests: HashMap::new(),
             awaiting_placement: HashSet::new(),
+            current_arrival: None,
             workers: std::array::from_fn(|_| Worker::new(kv_bytes_each)),
             profile,
             link: Link::new(link_bytes_per_second),
             waiters: BTreeMap::new(),
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         };
         let mut previous_id = None;
         for Arrival { id, request } in arrivals {
@@ -199,6 +208,68 @@ impl<'p> Replay<'p> {
     }
     pub fn link_bytes_per_second(&self) -> NonZeroU64 {
         self.link.rate
+    }
+    /// Project only currently observable state, without advancing replay.
+    pub fn router_view(&self, id: RequestId) -> Result<RouterView, String> {
+        if self.current_arrival != Some(id) || !self.awaiting_placement.contains(&id) {
+            return Err(format!(
+                "request {}: not the current unplaced arrival",
+                id.0
+            ));
+        }
+        let r = &self.requests[&id];
+        if !(1..profile::CONTEXT).contains(&r.input_length) {
+            return Err(format!("request {}: unsupported prompt length", id.0));
+        }
+        let blocks = BlockId::prompt(r);
+        let workers = [WorkerId::A, WorkerId::B].map(|dst| {
+            let w = &self.workers[dst as usize];
+            let matched = blocks.iter().take_while(|b| w.cache.contains(b)).count();
+            let cached_tokens = matched * BLOCK_TOKENS;
+            let can_admit_local = w.cache.can_allocate(
+                (r.input_length - cached_tokens + 1) as u64,
+                &blocks[..matched],
+            );
+            let pending = self
+                .pending
+                .values()
+                .filter(|(_, d, _)| *d == dst)
+                .map(|(j, _, _)| j);
+            let jobs = w
+                .prompts
+                .iter()
+                .chain(&w.responses)
+                .chain(pending)
+                .map(|j| JobView {
+                    input: j.input,
+                    processed: j.processed,
+                })
+                .collect();
+            WorkerView {
+                cached_tokens,
+                can_admit_local,
+                jobs,
+            }
+        });
+        let completed: u128 = self.workers.iter().map(|w| u128::from(w.completed)).sum();
+        let tokens: u128 = self.workers.iter().map(|w| w.emitted_on_completion).sum();
+        let mean_output_tokens = tokens.div_ceil(completed.max(1)).max(1) as usize;
+        let transfers = self
+            .link
+            .observed(self.now_ns)
+            .into_iter()
+            .map(|(remaining_bytes, (destination, blocks))| TransferView {
+                destination,
+                blocks,
+                remaining_bytes,
+            })
+            .collect();
+        Ok(RouterView {
+            input_tokens: r.input_length,
+            workers,
+            transfers,
+            mean_output_tokens,
+        })
     }
     /// Execution-side trace data, not a router view.
     pub fn request(&self, id: RequestId) -> Option<&TraceRequest> {
@@ -309,7 +380,7 @@ impl<'p> Replay<'p> {
         if missing.is_empty() {
             return self.ready(dst, job);
         }
-        self.pending.insert(id, (job, missing.len()));
+        self.pending.insert(id, (job, dst, missing.len()));
         for block in missing {
             self.waiters.entry((dst, block)).or_default().push(id);
         }
@@ -339,6 +410,7 @@ impl<'p> Replay<'p> {
     /// Apply completions before arrivals, and dispatch after all arrivals at this tick.
     /// A clock/scheduling error is fatal to this run.
     pub fn step(&mut self) -> Result<Option<Event>, String> {
+        self.current_arrival = None;
         loop {
             // Compare the next physical finish directly with the heap. A new
             // copy changes this deadline without leaving obsolete heap ticks.
@@ -390,10 +462,10 @@ impl<'p> Replay<'p> {
                                 self.workers[worker.other() as usize].cache.unpin(block, at);
                                 for id in ids {
                                     self.workers[*worker as usize].cache.pin(block, at);
-                                    let (_, left) = self.pending.get_mut(&id).unwrap();
+                                    let (_, _, left) = self.pending.get_mut(&id).unwrap();
                                     *left -= 1;
                                     if *left == 0 {
-                                        let (job, _) = self.pending.remove(&id).unwrap();
+                                        let (job, _, _) = self.pending.remove(&id).unwrap();
                                         self.ready(*worker, job)?;
                                     }
                                 }
@@ -402,6 +474,7 @@ impl<'p> Replay<'p> {
                         Event::DecodeCapacityFailure(_, _) => (),
                         Event::Arrival(id) => {
                             self.awaiting_placement.insert(*id);
+                            self.current_arrival = Some(*id);
                         }
                     }
                     return Ok(Some(event));
