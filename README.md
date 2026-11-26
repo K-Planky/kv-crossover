@@ -23,6 +23,27 @@ attention measurements are insufficient, which arrivals qualify and how
 much potential prefix reuse is lost. The [profile guide](profiles/README.md)
 documents the predictor and how to regenerate its timing table.
 
+## Worker rounds
+
+Both workers use the same nonpreemptive scheduler. At each clock tick the
+replay applies completions and block deliveries, handles tied arrivals in
+file order, then dispatches idle workers. A round decodes one token each for
+up to eight responses, then prefills up to 128 tokens for the oldest ready
+prompt. An empty phase costs nothing. An unfinished prompt stays at the
+head; responses rotate to the tail after their batch. Admission order is
+when work becomes ready, not the original arrival time. A fully cached
+prompt joins the response queue directly.
+
+In this model prefill **only** builds prompt KV. Even the first output token
+costs one decode step. At decode completion every member emits simultaneously,
+adds one logical token to its processed context, and leaves if its execution-side
+output count is exhausted. Profile padding never adds logical tokens. The
+single-worker clock tests (`cargo test --locked --test clock`) check elapsed
+phase times against the [independent predictor checks](profiles/README.md)
+and show a response's token gap lengthening by an intervening prefill chunk.
+These tests supply available prefix lengths; they do not model finite KV or
+run a routing policy.
+
 ## FAST ’25 workload audit
 
 ```sh

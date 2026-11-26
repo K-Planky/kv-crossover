@@ -1,8 +1,7 @@
-//! Single-threaded replay clock. Load one trace in source order, then drain `step`.
-//! Handling an arrival is synchronous: the next tied arrival sees its placement.
-
+//! Single-threaded event clock for both workers and the shared link.
 use crate::{
-    TraceRequest,
+    BLOCK_TOKENS, TraceRequest,
+    profile::{self, Profile},
     workload::{Arrival, RequestId},
 };
 use std::{
@@ -16,42 +15,113 @@ pub enum WorkerId {
     A,
     B,
 }
-
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct BlockId(pub u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Phase {
+    Prefill { id: RequestId, new_tokens: usize },
+    Decode(Vec<RequestId>),
+}
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Event {
-    WorkDone(WorkerId, RequestId),
+    WorkDone(WorkerId, Phase),
     BlockReceived(WorkerId, BlockId),
     Arrival(RequestId),
 }
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum Tick {
+    Publish(Event),
+    Dispatch(WorkerId),
+}
 
+struct Job {
+    id: RequestId,
+    processed: usize,
+    input: usize,
+    outputs_left: usize,
+}
 #[derive(Default)]
 struct Worker {
-    ready: VecDeque<RequestId>,
-    running: Option<RequestId>,
+    prompts: VecDeque<Job>,
+    responses: VecDeque<Job>,
     received: HashSet<BlockId>,
+    busy_or_scheduled: bool,
+    prefill_turn: bool,
 }
-
-pub struct Replay {
+impl Worker {
+    fn next_phase(&self, p: &Profile) -> Result<Option<(Phase, u64)>, String> {
+        if (self.prefill_turn || self.responses.is_empty())
+            && let Some(j) = self.prompts.front()
+        {
+            let new_tokens = (j.input - j.processed).min(profile::CHUNK);
+            return Ok(Some((
+                Phase::Prefill {
+                    id: j.id,
+                    new_tokens,
+                },
+                p.prefill_ns(j.processed, new_tokens)?,
+            )));
+        }
+        let batch = self.responses.iter().take(profile::BATCH);
+        if batch.len() == 0 {
+            return Ok(None);
+        }
+        let contexts: Vec<_> = batch.clone().map(|j| j.processed).collect();
+        Ok(Some((
+            Phase::Decode(batch.map(|j| j.id).collect()),
+            p.decode_ns(&contexts)?,
+        )))
+    }
+    fn finish(&mut self, phase: &Phase) {
+        match phase {
+            Phase::Prefill { id, new_tokens } => {
+                let j = self.prompts.front_mut().unwrap();
+                debug_assert_eq!(j.id, *id);
+                j.processed += new_tokens;
+                if j.processed == j.input {
+                    self.responses.push_back(self.prompts.pop_front().unwrap());
+                }
+                self.prefill_turn = false;
+            }
+            Phase::Decode(ids) => {
+                for id in ids {
+                    let mut j = self.responses.pop_front().unwrap();
+                    debug_assert_eq!(j.id, *id);
+                    j.processed += 1;
+                    j.outputs_left -= 1;
+                    if j.outputs_left > 0 {
+                        self.responses.push_back(j);
+                    }
+                }
+                self.prefill_turn = true;
+            }
+        }
+    }
+}
+pub struct Replay<'p> {
     now_ns: u64,
-    // Sequence is unique, so payload ordering never decides a tie.
-    events: BinaryHeap<Reverse<(u64, u8, u64, Event)>>,
+    events: BinaryHeap<Reverse<(u64, u8, u64, Tick)>>,
     sequence: u64,
     requests: HashMap<RequestId, TraceRequest>,
+    awaiting_placement: HashSet<RequestId>,
     workers: [Worker; 2],
+    profile: &'p Profile,
     link_bytes_per_second: NonZeroU64,
 }
-
-impl Replay {
-    pub fn new(arrivals: Vec<Arrival>, link_bytes_per_second: NonZeroU64) -> Result<Self, String> {
+impl<'p> Replay<'p> {
+    pub fn new(
+        arrivals: Vec<Arrival>,
+        link_bytes_per_second: NonZeroU64,
+        profile: &'p Profile,
+    ) -> Result<Self, String> {
         let mut replay = Self {
             now_ns: 0,
             events: BinaryHeap::new(),
             sequence: 0,
             requests: HashMap::new(),
+            awaiting_placement: HashSet::new(),
             workers: Default::default(),
+            profile,
             link_bytes_per_second,
         };
         let mut previous_id = None;
@@ -67,20 +137,22 @@ impl Replay {
                 .arrival_ms
                 .checked_mul(1_000_000)
                 .ok_or_else(|| format!("request {}: timestamp exceeds nanosecond range", id.0))?;
-            replay.schedule(at, Event::Arrival(id))?;
+            replay.schedule(at, Tick::Publish(Event::Arrival(id)))?;
             replay.requests.insert(id, request);
         }
         Ok(replay)
     }
-
-    fn schedule(&mut self, at: u64, event: Event) -> Result<(), String> {
+    fn schedule(&mut self, at: u64, tick: Tick) -> Result<(), String> {
+        let priority = match tick {
+            Tick::Dispatch(_) => 2,
+            Tick::Publish(Event::Arrival(_)) => 1,
+            _ => 0,
+        };
         let seq = self.sequence;
         self.sequence = seq.checked_add(1).ok_or("event sequence overflow")?;
-        let priority = u8::from(matches!(event, Event::Arrival(_)));
-        self.events.push(Reverse((at, priority, seq, event)));
+        self.events.push(Reverse((at, priority, seq, tick)));
         Ok(())
     }
-
     pub fn now_ns(&self) -> u64 {
         self.now_ns
     }
@@ -91,47 +163,50 @@ impl Replay {
     pub fn request(&self, id: RequestId) -> Option<&TraceRequest> {
         self.requests.get(&id)
     }
-    pub fn running(&self, worker: WorkerId) -> Option<RequestId> {
-        self.workers[worker as usize].running
-    }
     pub fn has_received(&self, worker: WorkerId, block: BlockId) -> bool {
         self.workers[worker as usize].received.contains(&block)
     }
-
-    /// Place an arrival in worker FIFO order. Called once by the arrival handler.
-    pub fn enqueue(&mut self, worker: WorkerId, id: RequestId) -> Result<(), String> {
-        if !self.requests.contains_key(&id) {
-            return Err(format!("unknown request {}", id.0));
-        }
-        self.workers[worker as usize].ready.push_back(id);
-        Ok(())
-    }
-
-    /// Start one queued unit of work if the worker is idle. The scheduler supplies its cost.
-    pub fn start_next(
+    /// Admit when the supplied prefix is actually available at this worker.
+    pub fn enqueue(
         &mut self,
         worker: WorkerId,
-        duration_ns: NonZeroU64,
-    ) -> Result<Option<RequestId>, String> {
-        let state = &self.workers[worker as usize];
-        let Some(&id) = state.ready.front() else {
-            return Ok(None);
-        };
-        if state.running.is_some() {
-            return Ok(None);
+        id: RequestId,
+        cached: usize,
+    ) -> Result<(), String> {
+        if !self.awaiting_placement.contains(&id) {
+            return Err(format!("request {}: not awaiting placement", id.0));
         }
-        let at = self
-            .now_ns
-            .checked_add(duration_ns.get())
-            .ok_or_else(|| format!("request {}: work finish time overflow", id.0))?;
-        self.schedule(at, Event::WorkDone(worker, id))?;
-        let state = &mut self.workers[worker as usize];
-        state.ready.pop_front();
-        state.running = Some(id);
-        Ok(Some(id))
+        let r = &self.requests[&id];
+        if !profile::supported(r) || cached > r.input_length || !cached.is_multiple_of(BLOCK_TOKENS)
+        {
+            return Err(format!(
+                "request {}: unsupported lengths or cached prefix {cached}",
+                id.0
+            ));
+        }
+        let job = Job {
+            id,
+            processed: cached,
+            input: r.input_length,
+            outputs_left: r.output_length,
+        };
+        self.wake(worker)?;
+        self.awaiting_placement.remove(&id);
+        let w = &mut self.workers[worker as usize];
+        if cached == job.input {
+            w.responses.push_back(job)
+        } else {
+            w.prompts.push_back(job)
+        }
+        Ok(())
     }
-
-    /// Link service supplies the delivery delay; scheduling does not publish the block.
+    fn wake(&mut self, worker: WorkerId) -> Result<(), String> {
+        if !self.workers[worker as usize].busy_or_scheduled {
+            self.schedule(self.now_ns, Tick::Dispatch(worker))?;
+            self.workers[worker as usize].busy_or_scheduled = true;
+        }
+        Ok(())
+    }
     pub fn receive_after(
         &mut self,
         worker: WorkerId,
@@ -142,20 +217,45 @@ impl Replay {
             .now_ns
             .checked_add(delay_ns.get())
             .ok_or_else(|| format!("block {}: delivery time overflow", block.0))?;
-        self.schedule(at, Event::BlockReceived(worker, block))
+        self.schedule(at, Tick::Publish(Event::BlockReceived(worker, block)))
     }
-
-    /// Advance to one event and apply its completion effects before returning it.
-    pub fn step(&mut self) -> Option<Event> {
-        let Reverse((at, _, _, event)) = self.events.pop()?;
-        self.now_ns = at;
-        match event {
-            Event::WorkDone(worker, _) => self.workers[worker as usize].running = None,
-            Event::BlockReceived(worker, block) => {
-                self.workers[worker as usize].received.insert(block);
+    /// Apply completions before arrivals, and dispatch after all arrivals at this tick.
+    /// A clock/scheduling error is fatal to this run.
+    pub fn step(&mut self) -> Result<Option<Event>, String> {
+        while let Some(Reverse((at, _, _, tick))) = self.events.pop() {
+            self.now_ns = at;
+            match tick {
+                Tick::Dispatch(worker) => {
+                    let w = &mut self.workers[worker as usize];
+                    if let Some((phase, ns)) = w.next_phase(self.profile)? {
+                        let end = at.checked_add(ns).ok_or_else(|| {
+                            format!("worker {worker:?}: {phase:?} finish time overflow")
+                        })?;
+                        self.schedule(end, Tick::Publish(Event::WorkDone(worker, phase)))?;
+                    } else {
+                        w.busy_or_scheduled = false;
+                        w.prefill_turn = false;
+                    }
+                }
+                Tick::Publish(event) => {
+                    match &event {
+                        Event::WorkDone(worker, phase) => {
+                            let w = &mut self.workers[*worker as usize];
+                            w.finish(phase);
+                            w.busy_or_scheduled = false;
+                            self.wake(*worker)?;
+                        }
+                        Event::BlockReceived(worker, block) => {
+                            self.workers[*worker as usize].received.insert(*block);
+                        }
+                        Event::Arrival(id) => {
+                            self.awaiting_placement.insert(*id);
+                        }
+                    }
+                    return Ok(Some(event));
+                }
             }
-            Event::Arrival(_) => (),
         }
-        Some(event)
+        Ok(None)
     }
 }
