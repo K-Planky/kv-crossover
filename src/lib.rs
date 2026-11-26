@@ -1,3 +1,4 @@
+pub mod profile;
 pub mod workload;
 
 use serde::Deserialize;
@@ -26,7 +27,7 @@ impl TraceRequest {
         Ok(request)
     }
 
-    fn full_blocks(&self) -> impl Iterator<Item = &u64> {
+    pub fn full_blocks(&self) -> impl Iterator<Item = &u64> {
         self.hash_ids.iter().take(self.input_length / BLOCK_TOKENS)
     }
 }

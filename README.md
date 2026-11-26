@@ -17,8 +17,11 @@ The matcher compares hashes in order until the first difference. Only full
 512-token blocks from both prompts qualify. Here 12 blocks match; the remaining
 328 of the arriving prompt’s 6,472 tokens need local processing.
 
-The [A100 pilot profile](profiles/README.md) estimates worker compute costs;
-it is not yet a qualified replay configuration.
+All four routers will use two identical single-A100 workers. The
+[hardware qualification](profiles/qualification.md) explains why the H200
+attention measurements are insufficient, which arrivals qualify and how
+much potential prefix reuse is lost. The [profile guide](profiles/README.md)
+documents the predictor and how to regenerate its timing table.
 
 ## FAST ’25 workload audit
 
@@ -42,7 +45,8 @@ digests are in [`experiments/paper.toml`](experiments/paper.toml).
 
 Lengths are **input plus output** tokens, with nearest-rank percentiles over
 all arrivals in each file. Many requests exceed the original Llama 3 8B
-context limit; this is a coverage check, not a decision to filter the replay.
+context limit. The audit also verifies the selected profile and prints the
+request and prefix-token counts for the fixed replay subset.
 The loader keeps the one-based JSONL line as the request ID within its trace,
 preserves relative millisecond timestamps and does not reorder ties. Invalid
 records (including blank lines) or decreasing timestamps fail rather than

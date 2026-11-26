@@ -1,4 +1,9 @@
 # Paths relative to this config; the two Mooncake files come from FAST25-release/traces/.
+# Selected for every policy: two identical A100 workers; accounting in profiles/qualification.md.
+[workers]
+count = 2
+kv_bytes_each = 51539607552 # 48 GiB
+
 [vidur_a100]
 repository = "https://github.com/microsoft/vidur"
 revision = "abae7f63aa857300f5cdc6f5e0d27860cd24721b"

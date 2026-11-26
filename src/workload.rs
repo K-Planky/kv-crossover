@@ -16,14 +16,18 @@ pub struct Arrival {
 }
 
 #[derive(Deserialize)]
-pub struct TraceFile {
+pub struct VerifiedFile {
     path: PathBuf,
     sha256: String,
 }
 
-impl TraceFile {
-    pub fn load(&self, config_dir: &Path) -> Result<Vec<Arrival>, String> {
-        let path = config_dir.join(&self.path);
+impl VerifiedFile {
+    pub fn path(&self, config_dir: &Path) -> PathBuf {
+        config_dir.join(&self.path)
+    }
+
+    pub fn read(&self, config_dir: &Path) -> Result<String, String> {
+        let path = self.path(config_dir);
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let actual: String = Sha256::digest(&bytes)
             .iter()
@@ -36,8 +40,11 @@ impl TraceFile {
                 self.sha256
             ));
         }
-        let input = std::str::from_utf8(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        parse_arrivals(input, &path)
+        String::from_utf8(bytes).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn load_arrivals(&self, dir: &Path) -> Result<Vec<Arrival>, String> {
+        parse_arrivals(&self.read(dir)?, &self.path(dir))
     }
 }
 
