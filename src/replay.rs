@@ -1,6 +1,7 @@
 //! Single-threaded event clock for both workers and the shared link.
 use crate::{
-    BLOCK_TOKENS, TraceRequest,
+    TraceRequest,
+    kv::{Cache, Lease},
     profile::{self, Profile},
     workload::{Arrival, RequestId},
 };
@@ -15,8 +16,7 @@ pub enum WorkerId {
     A,
     B,
 }
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct BlockId(pub u64);
+pub use crate::kv::BlockId;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Phase {
     Prefill { id: RequestId, new_tokens: usize },
@@ -27,6 +27,7 @@ pub enum Event {
     WorkDone(WorkerId, Phase),
     BlockReceived(WorkerId, BlockId),
     Arrival(RequestId),
+    DecodeCapacityFailure(WorkerId, RequestId),
 }
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Tick {
@@ -39,16 +40,25 @@ struct Job {
     processed: usize,
     input: usize,
     outputs_left: usize,
+    lease: Lease,
 }
-#[derive(Default)]
 struct Worker {
     prompts: VecDeque<Job>,
     responses: VecDeque<Job>,
-    received: HashSet<BlockId>,
+    cache: Cache,
     busy_or_scheduled: bool,
     prefill_turn: bool,
 }
 impl Worker {
+    fn new(kv_bytes: u64) -> Self {
+        Self {
+            prompts: VecDeque::new(),
+            responses: VecDeque::new(),
+            cache: Cache::new(kv_bytes),
+            busy_or_scheduled: false,
+            prefill_turn: false,
+        }
+    }
     fn next_phase(&self, p: &Profile) -> Result<Option<(Phase, u64)>, String> {
         if (self.prefill_turn || self.responses.is_empty())
             && let Some(j) = self.prompts.front()
@@ -72,30 +82,45 @@ impl Worker {
             p.decode_ns(&contexts)?,
         )))
     }
-    fn finish(&mut self, phase: &Phase) {
+    fn finish(&mut self, phase: &Phase, now: u64) -> Vec<RequestId> {
+        let mut failed = Vec::new();
         match phase {
             Phase::Prefill { id, new_tokens } => {
                 let j = self.prompts.front_mut().unwrap();
                 debug_assert_eq!(j.id, *id);
                 j.processed += new_tokens;
+                self.cache.computed(&mut j.lease, j.processed, now);
                 if j.processed == j.input {
                     self.responses.push_back(self.prompts.pop_front().unwrap());
                 }
                 self.prefill_turn = false;
             }
             Phase::Decode(ids) => {
+                let mut continuing = Vec::new();
                 for id in ids {
                     let mut j = self.responses.pop_front().unwrap();
                     debug_assert_eq!(j.id, *id);
                     j.processed += 1;
                     j.outputs_left -= 1;
-                    if j.outputs_left > 0 {
+                    if j.outputs_left == 0 {
+                        self.cache.release(j.lease, now);
+                    } else {
+                        continuing.push(j);
+                    }
+                }
+                // All departures from this batch free their KV before survivors grow.
+                for mut j in continuing {
+                    if self.cache.grow(&mut j.lease) {
                         self.responses.push_back(j);
+                    } else {
+                        failed.push(j.id);
+                        self.cache.release(j.lease, now);
                     }
                 }
                 self.prefill_turn = true;
             }
         }
+        failed
     }
 }
 pub struct Replay<'p> {
@@ -113,6 +138,7 @@ impl<'p> Replay<'p> {
         arrivals: Vec<Arrival>,
         link_bytes_per_second: NonZeroU64,
         profile: &'p Profile,
+        kv_bytes_each: u64,
     ) -> Result<Self, String> {
         let mut replay = Self {
             now_ns: 0,
@@ -120,7 +146,7 @@ impl<'p> Replay<'p> {
             sequence: 0,
             requests: HashMap::new(),
             awaiting_placement: HashSet::new(),
-            workers: Default::default(),
+            workers: std::array::from_fn(|_| Worker::new(kv_bytes_each)),
             profile,
             link_bytes_per_second,
         };
@@ -163,28 +189,27 @@ impl<'p> Replay<'p> {
     pub fn request(&self, id: RequestId) -> Option<&TraceRequest> {
         self.requests.get(&id)
     }
-    pub fn has_received(&self, worker: WorkerId, block: BlockId) -> bool {
-        self.workers[worker as usize].received.contains(&block)
+    pub fn is_resident(&self, worker: WorkerId, block: &BlockId) -> bool {
+        self.workers[worker as usize].cache.contains(block)
     }
-    /// Admit when the supplied prefix is actually available at this worker.
-    pub fn enqueue(
-        &mut self,
-        worker: WorkerId,
-        id: RequestId,
-        cached: usize,
-    ) -> Result<(), String> {
+    pub fn used_kv_tokens(&self, worker: WorkerId) -> u64 {
+        self.workers[worker as usize].cache.used()
+    }
+    /// Match and pin the actual local prefix, reserving the remaining prompt and first decode slot.
+    pub fn enqueue(&mut self, worker: WorkerId, id: RequestId) -> Result<(), String> {
         if !self.awaiting_placement.contains(&id) {
             return Err(format!("request {}: not awaiting placement", id.0));
         }
         let r = &self.requests[&id];
-        if !profile::supported(r) || cached > r.input_length || !cached.is_multiple_of(BLOCK_TOKENS)
-        {
-            return Err(format!(
-                "request {}: unsupported lengths or cached prefix {cached}",
-                id.0
-            ));
+        if !profile::supported(r) {
+            return Err(format!("request {}: unsupported lengths", id.0));
         }
+        let (cached, lease) = self.workers[worker as usize]
+            .cache
+            .admit(r, self.now_ns)
+            .ok_or_else(|| format!("request {}: insufficient KV on {worker:?}", id.0))?;
         let job = Job {
+            lease,
             id,
             processed: cached,
             input: r.input_length,
@@ -216,7 +241,8 @@ impl<'p> Replay<'p> {
         let at = self
             .now_ns
             .checked_add(delay_ns.get())
-            .ok_or_else(|| format!("block {}: delivery time overflow", block.0))?;
+            .ok_or_else(|| format!("block {block:?}: delivery time overflow"))?;
+        self.workers[worker as usize].cache.reserve(&block)?;
         self.schedule(at, Tick::Publish(Event::BlockReceived(worker, block)))
     }
     /// Apply completions before arrivals, and dispatch after all arrivals at this tick.
@@ -241,13 +267,20 @@ impl<'p> Replay<'p> {
                     match &event {
                         Event::WorkDone(worker, phase) => {
                             let w = &mut self.workers[*worker as usize];
-                            w.finish(phase);
+                            let failed = w.finish(phase, at);
                             w.busy_or_scheduled = false;
+                            for id in failed {
+                                self.schedule(
+                                    at,
+                                    Tick::Publish(Event::DecodeCapacityFailure(*worker, id)),
+                                )?;
+                            }
                             self.wake(*worker)?;
                         }
                         Event::BlockReceived(worker, block) => {
-                            self.workers[*worker as usize].received.insert(*block);
+                            self.workers[*worker as usize].cache.receive(block, at);
                         }
+                        Event::DecodeCapacityFailure(_, _) => (),
                         Event::Arrival(id) => {
                             self.awaiting_placement.insert(*id);
                         }

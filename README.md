@@ -41,8 +41,27 @@ output count is exhausted. Profile padding never adds logical tokens. The
 single-worker clock tests (`cargo test --locked --test clock`) check elapsed
 phase times against the [independent predictor checks](profiles/README.md)
 and show a response's token gap lengthening by an intervening prefill chunk.
-These tests supply available prefix lengths; they do not model finite KV or
-run a routing policy.
+The tests warm the cache with scheduled block deliveries, not a supplied hit count.
+
+## Finite worker KV
+
+Each worker gets its own byte budget (48 GiB in the selected profile), rounded
+down to whole 131,072-byte token slots. At admission, scan complete blocks in
+order until the first miss; a key includes all preceding hashes. Pin the hits
+and reserve private slots for the uncached prompt (including its partial tail)
+and one output token. A failed admission changes no cache state. A prefill
+completion publishes each newly finished full block, merging identical KV if
+another job or delivery already published it. Partial blocks and output KV
+stay private. A scheduled incoming block holds 512 slots but is not a hit until
+delivery; this step models destination memory, not link contention.
+
+After a decode batch emits, release finished jobs first. In batch order, each
+survivor reserves one more slot. If it cannot, report a decode capacity failure
+at that tick and release its pins and private slots; already emitted tokens
+still count. No job reserves its recorded future output length. For space,
+evict unpinned resident blocks by oldest last use (pin, publication or release),
+then lexicographic hash path on a tied tick. Eviction need not preserve parents:
+a resident descendant past a gap is not a prefix hit.
 
 ## FAST ’25 workload audit
 

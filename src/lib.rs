@@ -1,3 +1,4 @@
+pub mod kv;
 pub mod profile;
 pub mod replay;
 pub mod workload;
