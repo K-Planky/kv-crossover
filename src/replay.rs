@@ -5,7 +5,7 @@ use crate::{
     kv::{Cache, Lease},
     link::Link,
     profile::{self, Profile},
-    router::{JobView, RouterView, TransferView, WorkerView},
+    router::{Action, CopyPlan, JobView, RouterView, TransferView, WorkerView},
     workload::{Arrival, RequestId},
 };
 use std::{
@@ -28,6 +28,8 @@ impl WorkerId {
     }
 }
 pub use crate::kv::BlockId;
+#[cfg(test)]
+mod hand_tests;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Phase {
     Prefill { id: RequestId, new_tokens: usize },
@@ -222,6 +224,16 @@ impl<'p> Replay<'p> {
             return Err(format!("request {}: unsupported prompt length", id.0));
         }
         let blocks = BlockId::prompt(r);
+        let transfers: Vec<_> = self
+            .link
+            .observed(self.now_ns)
+            .into_iter()
+            .map(|(remaining_bytes, (destination, blocks))| TransferView {
+                destination,
+                blocks,
+                remaining_bytes,
+            })
+            .collect();
         let workers = [WorkerId::A, WorkerId::B].map(|dst| {
             let w = &self.workers[dst as usize];
             let matched = blocks.iter().take_while(|b| w.cache.contains(b)).count();
@@ -245,7 +257,38 @@ impl<'p> Replay<'p> {
                     processed: j.processed,
                 })
                 .collect();
+            // Extend the resident prefix only across locally held, joinable or
+            // remotely resident blocks. Unrelated synthetic arrivals cannot be joined.
+            let mut prefix = matched;
+            let mut new_blocks = 0;
+            let mut joined = std::collections::BTreeSet::new();
+            for block in &blocks[matched..] {
+                if !w.cache.contains(block) {
+                    if let Some(i) = transfers
+                        .iter()
+                        .position(|t| t.destination == dst && t.blocks.contains(block))
+                    {
+                        joined.insert(i);
+                    } else if !w.cache.is_incoming(block) && self.is_resident(dst.other(), block) {
+                        new_blocks += 1;
+                    } else {
+                        break;
+                    }
+                }
+                prefix += 1;
+            }
+            let slots = r.input_length + 1 - (prefix - new_blocks) * BLOCK_TOKENS;
+            let copy = (prefix > matched && w.cache.can_allocate(slots as u64, &blocks[..prefix]))
+                .then(|| CopyPlan {
+                    prefix_blocks: prefix,
+                    new_bytes: (new_blocks * BLOCK_TOKENS) as u64 * BYTES_PER_TOKEN,
+                    joined_remaining: joined
+                        .into_iter()
+                        .map(|i| transfers[i].remaining_bytes)
+                        .collect(),
+                });
             WorkerView {
+                copy,
                 cached_tokens,
                 can_admit_local,
                 jobs,
@@ -254,22 +297,19 @@ impl<'p> Replay<'p> {
         let completed: u128 = self.workers.iter().map(|w| u128::from(w.completed)).sum();
         let tokens: u128 = self.workers.iter().map(|w| w.emitted_on_completion).sum();
         let mean_output_tokens = tokens.div_ceil(completed.max(1)).max(1) as usize;
-        let transfers = self
-            .link
-            .observed(self.now_ns)
-            .into_iter()
-            .map(|(remaining_bytes, (destination, blocks))| TransferView {
-                destination,
-                blocks,
-                remaining_bytes,
-            })
-            .collect();
         Ok(RouterView {
+            link_rate: self.link.rate,
             input_tokens: r.input_length,
             workers,
             transfers,
             mean_output_tokens,
         })
+    }
+    pub fn place(&mut self, worker: WorkerId, id: RequestId, action: Action) -> Result<(), String> {
+        match action {
+            Action::Transfer { prefix_blocks } => self.transfer(worker, id, prefix_blocks),
+            Action::Wait | Action::Recompute => self.enqueue(worker, id),
+        }
     }
     /// Execution-side trace data, not a router view.
     pub fn request(&self, id: RequestId) -> Option<&TraceRequest> {

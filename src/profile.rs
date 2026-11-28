@@ -21,6 +21,20 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Controlled oracle timings, not hardware measurements. 48 cold chunks
+    /// add 90 ms; the three tail chunks plus one decode take 10 ms.
+    #[cfg(test)]
+    pub(crate) fn hand_oracle() -> Self {
+        let mut p = Self {
+            prefill: [[2_000_000; 2]; CONTEXT / CHUNK],
+            decode: [[4_000_000; CONTEXT / 64]; BATCH],
+        };
+        p.prefill[..6144 / CHUNK].fill([1_875_000; 2]);
+        for (context, ms) in [(512, 100), (1024, 20), (1536, 40)] {
+            p.decode[0][context / 64 - 1] = ms * 1_000_000;
+        }
+        p
+    }
     pub fn load(file: &VerifiedFile, dir: &Path) -> Result<Self, String> {
         let input = file.read(dir)?;
         Self::parse(&input).map_err(|e| format!("{}: {e}", file.path(dir).display()))
@@ -105,8 +119,10 @@ mod tests {
                 cached_tokens: 0,
                 can_admit_local: true,
                 jobs: vec![],
+                copy: None,
             }),
             transfers: vec![],
+            link_rate: std::num::NonZeroU64::MIN,
             mean_output_tokens: 1,
         };
         assert!(view.local_scores(&p).unwrap_err().contains("overflow"));

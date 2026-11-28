@@ -43,6 +43,31 @@ This serial-work proxy ignores batching, copy delays and fractional progress
 inside a phase: a long response can make a worker look busier than it is.
 Neither scoring nor history estimation reads recorded output lengths.
 
+## Wait, transfer, or recompute
+
+A local placement is **wait** on a worker tied for the longest nonempty
+resident match, **recompute** otherwise (still reusing whatever is local).
+The transfer alternative acquires the longest contiguous prefix available
+from the two caches and joinable batches. It must extend the local match
+and fit the destination KV budget, including new reservations. This rule
+does not search shorter partial-copy lengths.
+
+Both forecasts score `max(predicted backlog, predicted blocks-ready delay)
++ remaining prefill + first decode`. Nominal divides required physical work
+by idle bandwidth: new bytes plus the remaining bytes of each joined batch
+once. Aware also accounts for independent batches, assuming no later starts.
+If the largest required batch has M bytes left, every active batch with r
+bytes left receives min(M,r) bytes before that last required finish. Include
+the proposed new batch in this sum. Both policies join and execute on the
+same physical link. Equal TTFT favors no new copy, then the lower worker ID.
+
+`cargo test --locked measured_hand_crossover` forces each action rather than
+treating its score as an outcome. The 6,144-token prefix occupies 768 MiB
+(K and V × 32 layers × 8 KV heads × 128 elements × 2 bytes per element).
+At 12.5 GiB/s a second equal-sized copy changes the transfer's measured TTFT
+from 70 to 130 ms; waiting and recomputing remain at 110 and 100 ms. These
+are controlled service costs, not measurements of A100 performance.
+
 ## Worker rounds
 
 Both workers use the same nonpreemptive scheduler. At each clock tick the

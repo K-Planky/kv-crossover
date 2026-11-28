@@ -271,6 +271,15 @@ fn two_placements_join_a_batch_while_destination_computes() {
                     let view = r.router_view(id).unwrap();
                     assert_eq!(view.transfers.len(), 1);
                     assert_eq!(view.transfers[0].remaining_bytes, bytes / 2);
+                    for forecast in [
+                        kv_crossover::router::CopyForecast::Nominal,
+                        kv_crossover::router::CopyForecast::ContentionAware,
+                    ] {
+                        let scores = view.action_scores(&p, Some(forecast)).unwrap();
+                        let join = scores.iter().find(|s| s.placement.worker == B).unwrap();
+                        assert_eq!(join.new_copy_bytes, 0);
+                        assert_eq!(join.predicted_blocks_ready_ns, 1_000_000);
+                    }
                     // Two assigned logical jobs, including the copy waiter.
                     // No room for local recomputation while its reservation is live.
                     assert!(!view.workers[1].can_admit_local);
@@ -365,7 +374,21 @@ fn partial_join_waits_for_both_batches_and_does_not_resend_root() {
                 r.transfer(B, RequestId(1), 1).unwrap();
                 r.receive_after(A, BlockId(vec![0, 0]), nz(1)).unwrap();
             }
-            Arr(id) => r.transfer(B, id, 2).unwrap(),
+            Arr(id) => {
+                // 3/4 of the root batch remains, plus a new full block.
+                let scores = r
+                    .router_view(id)
+                    .unwrap()
+                    .action_scores(
+                        &p,
+                        Some(kv_crossover::router::CopyForecast::ContentionAware),
+                    )
+                    .unwrap();
+                let copy = scores.iter().find(|s| s.new_copy_bytes != 0).unwrap();
+                assert_eq!(copy.new_copy_bytes, block_bytes);
+                assert_eq!(copy.predicted_blocks_ready_ns, 7_000_000);
+                r.place(B, id, copy.action).unwrap();
+            }
             BlockReceived(B, block) => deliveries.push((r.now_ns(), block)),
             WorkDone(B, Phase::Decode(ids)) => decoded.extend(ids),
             BlockReceived(A, _) => (),

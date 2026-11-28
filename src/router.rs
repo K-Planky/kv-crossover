@@ -1,14 +1,17 @@
-//! Arrival-time observations and local-only placement rules. No trace rows or event heap.
+//! Arrival-time observations and placement rules. No trace rows or event heap.
+use crate::BLOCK_TOKENS;
 use crate::{
     profile::{self, Profile},
     replay::{BlockId, WorkerId},
 };
+use std::num::NonZeroU64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct RouterView {
     pub input_tokens: usize,
     pub workers: [WorkerView; 2], // A, B
     pub transfers: Vec<TransferView>,
+    pub(crate) link_rate: NonZeroU64,
     pub(crate) mean_output_tokens: usize,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -22,6 +25,14 @@ pub struct WorkerView {
     pub cached_tokens: usize,
     pub can_admit_local: bool,
     pub(crate) jobs: Vec<JobView>,
+    pub(crate) copy: Option<CopyPlan>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CopyPlan {
+    pub prefix_blocks: usize,
+    pub new_bytes: u64,
+    // Each joined physical batch is counted once, even for multiple needed blocks.
+    pub joined_remaining: Vec<u64>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct JobView {
@@ -67,11 +78,75 @@ fn prefill_ns(p: &Profile, mut cached: usize, input: usize) -> Result<u64, Strin
     }
     Ok(ns)
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyForecast {
+    Nominal,
+    ContentionAware,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Wait,
+    Recompute,
+    Transfer { prefix_blocks: usize },
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct ActionScore {
+    pub action: Action,
+    pub placement: LocalScore,
+    pub new_copy_bytes: u64,
+    pub predicted_blocks_ready_ns: u64,
+}
+pub fn earliest(scores: &[ActionScore]) -> Option<&ActionScore> {
+    scores.iter().min_by_key(|s| {
+        (
+            s.placement.predicted_ttft_ns,
+            s.new_copy_bytes != 0,
+            s.placement.worker,
+        )
+    })
+}
 impl RouterView {
+    fn blocks_ready_ns(&self, plan: &CopyPlan, forecast: CopyForecast) -> Result<u64, String> {
+        let required = plan
+            .joined_remaining
+            .iter()
+            .copied()
+            .chain([plan.new_bytes]);
+        let bytes: u128 = match forecast {
+            CopyForecast::Nominal => required.map(u128::from).sum(),
+            CopyForecast::ContentionAware => {
+                // By the last required finish, every batch has received at most
+                // that batch's remaining size in service (equal sharing).
+                let last = required.max().unwrap();
+                self.transfers
+                    .iter()
+                    .map(|t| u128::from(last.min(t.remaining_bytes)))
+                    .sum::<u128>()
+                    + u128::from(plan.new_bytes)
+            }
+        };
+        let ns = bytes
+            .checked_mul(1_000_000_000)
+            .ok_or("predicted copy duration overflow")?
+            .div_ceil(u128::from(self.link_rate.get()));
+        u64::try_from(ns).map_err(|_| "predicted copy duration overflow".into())
+    }
     pub fn local_scores(&self, p: &Profile) -> Result<Vec<LocalScore>, String> {
+        Ok(self
+            .action_scores(p, None)?
+            .into_iter()
+            .map(|s| s.placement)
+            .collect())
+    }
+    pub fn action_scores(
+        &self,
+        p: &Profile,
+        forecast: Option<CopyForecast>,
+    ) -> Result<Vec<ActionScore>, String> {
         let mut scores = Vec::new();
+        let longest = self.workers.iter().map(|w| w.cached_tokens).max().unwrap();
         for (worker, view) in [WorkerId::A, WorkerId::B].into_iter().zip(&self.workers) {
-            if !view.can_admit_local {
+            if !view.can_admit_local && (forecast.is_none() || view.copy.is_none()) {
                 continue;
             }
             let mut backlog = 0;
@@ -92,17 +167,77 @@ impl RouterView {
                     decode,
                 )?;
             }
-            let service = add_ns(
-                prefill_ns(p, view.cached_tokens, self.input_tokens)?,
-                p.decode_ns(&[self.input_tokens])?,
-            )?;
-            scores.push(LocalScore {
-                worker,
-                queued_and_active: view.jobs.len(),
-                predicted_backlog_ns: backlog,
-                predicted_ttft_ns: add_ns(backlog, service)?,
-            });
+            let mut score = |action, cached, ready, new_copy_bytes| -> Result<(), String> {
+                let service = add_ns(
+                    prefill_ns(p, cached, self.input_tokens)?,
+                    p.decode_ns(&[self.input_tokens])?,
+                )?;
+                scores.push(ActionScore {
+                    action,
+                    new_copy_bytes,
+                    predicted_blocks_ready_ns: ready,
+                    placement: LocalScore {
+                        worker,
+                        queued_and_active: view.jobs.len(),
+                        predicted_backlog_ns: backlog,
+                        predicted_ttft_ns: add_ns(backlog.max(ready), service)?,
+                    },
+                });
+                Ok(())
+            };
+            if view.can_admit_local {
+                let action = if view.cached_tokens > 0 && view.cached_tokens == longest {
+                    Action::Wait
+                } else {
+                    Action::Recompute
+                };
+                score(action, view.cached_tokens, 0, 0)?;
+            }
+            if let (Some(f), Some(plan)) = (forecast, &view.copy) {
+                score(
+                    Action::Transfer {
+                        prefix_blocks: plan.prefix_blocks,
+                    },
+                    plan.prefix_blocks * BLOCK_TOKENS,
+                    self.blocks_ready_ns(plan, f)?,
+                    plan.new_bytes,
+                )?;
+            }
         }
         Ok(scores)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ties_prefer_no_new_batch_then_worker_id() {
+        let score = |worker, bytes| ActionScore {
+            action: Action::Transfer { prefix_blocks: 1 },
+            predicted_blocks_ready_ns: 0,
+            new_copy_bytes: bytes,
+            placement: LocalScore {
+                worker,
+                queued_and_active: 0,
+                predicted_backlog_ns: 0,
+                predicted_ttft_ns: 100,
+            },
+        };
+        use WorkerId::*;
+        assert_eq!(
+            earliest(&[score(A, 1), score(B, 0)])
+                .unwrap()
+                .placement
+                .worker,
+            B
+        );
+        assert_eq!(
+            earliest(&[score(B, 0), score(A, 0)])
+                .unwrap()
+                .placement
+                .worker,
+            A
+        );
     }
 }
